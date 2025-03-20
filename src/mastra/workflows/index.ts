@@ -2,8 +2,9 @@ import { openai } from "@ai-sdk/openai";
 import { Agent, Step, Workflow } from "@mastra/core";
 import { z } from "zod";
 import { htmlAgent } from "../agents";
-import { MDocument } from "@mastra/rag";
+import { MDocument, rerank } from "@mastra/rag";
 import { embed, embedMany } from "ai";
+import { vectorQueryTool } from "../tools";
 
 const agentSelector = new Agent({
   name: "CryptoAgentSelector",
@@ -11,6 +12,25 @@ const agentSelector = new Agent({
     "You are a Crypto related knowledge agent selector your role is help user to select the approach agent to being in the future step base on the question user provided and the context you have.",
   model: openai("gpt-4o-mini"),
 });
+
+const vvsAgent = new Agent({
+  name: "vvsAgent",
+  instructions: `You are a helpful assistant focus on VVS Dapp that answers questions based on the provided context. Format your answers as follows:`,
+  model: openai("gpt-4o-mini"),
+  tools: {
+    vectorQueryTool,
+  },
+});
+
+export const URL_MAPS: Record<string, string[]> = {
+  VVS: ["https://docs.vvs.finance"],
+  Corgi: ["https://docs.corgiai.xyz/"],
+};
+
+export const AgentMap: Record<string, Agent> = {
+  VVS: vvsAgent,
+  Corgi: vvsAgent,
+};
 
 const myWorkflow = new Workflow({
   name: "my-workflow",
@@ -41,7 +61,7 @@ const selectAgent = new Step({
       {
         context: [
           {
-            role: "user",
+            role: 'user',
             content: question,
           },
           {
@@ -63,11 +83,6 @@ const selectAgent = new Step({
     };
   },
 });
-
-export const URL_MAPS: Record<string, string[]> = {
-  VVS: ["https://docs.vvs.finance"],
-  Corgi: ["https://docs.corgiai.xyz/"],
-};
 
 const loadDocuments = new Step({
   id: "loadDocuments",
@@ -110,14 +125,16 @@ const loadDocuments = new Step({
         ],
       });
 
+      console.log('chunks', chunks)
+
       const pgVector = mastra?.getVector("pgVector");
 
       const { embeddings } = await embedMany({
         model: openai.embedding("text-embedding-3-small"),
-        values: chunks.map((chunk) => chunk.text),
+        values: chunks
+          .map((chunk) => chunk.text)
+          .filter((text) => text.trim() !== ""),
       });
-
-      console.log("successfull embedMany ");
 
       await pgVector?.createIndex({
         indexName: "embeddings",
@@ -130,23 +147,71 @@ const loadDocuments = new Step({
       });
 
       const { embedding } = await embed({
-        value: question,
         model: openai.embedding("text-embedding-3-small"),
+        value: question,
       });
 
-      // Query vector store
-      const results = await pgVector?.query({
+      const initialResults = await pgVector?.query({
         indexName: "embeddings",
         queryVector: embedding,
-        topK: 10,
+        topK: 3,
       });
+      
+      console.log('initialResults', initialResults)
 
-      console.log("results", results);
+      return {
+        result: initialResults
+      }
     } catch (e) {
       console.log("error", e);
     }
   },
 });
-myWorkflow.step(selectAgent).then(loadDocuments).commit();
+
+const generateAnswer = new Step({
+  id: "generateAnswer",
+  execute: async ({ context, mastra }) => {
+    try {
+      const question = context?.triggerData?.question;
+      if (!question) {
+        throw new Error("Question not found in trigger data");
+      }
+
+      const selectedAgent = context.getStepResult<{ agent: string }>(
+        "selectAgent"
+      )?.agent;
+
+      const agent = AgentMap[selectedAgent];
+
+      const relevantDocuments: MDocument[] = []
+      // Format the relevant documents as context
+      const documentContext = relevantDocuments.length > 0 
+        ? `Here are the relevant documents:\n${relevantDocuments.map(doc => doc.text).join('\n\n')}`
+        : "No relevant documents found.";
+
+      const prompt = `
+        Please base your answer only on the context provided below. 
+        If the context doesn't contain enough information to fully answer the question, please state that explicitly.
+        
+        ${documentContext}
+        `;
+
+      const completion = await agent.generate(prompt, {
+        context: [
+          {
+            role: "user",
+            content: question,
+          },
+        ],
+      });
+      
+      console.log("completion.text", completion.text);
+      return { answer: completion.text };
+    } catch (e) {
+      console.log("error", e);
+    }
+  },
+});
+myWorkflow.step(selectAgent).then(loadDocuments).then(generateAnswer).commit();
 
 export { myWorkflow };
